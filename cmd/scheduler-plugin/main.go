@@ -1,11 +1,15 @@
 package main
 
 import (
+	"os"
+
 	"github.com/leon37/AIInfraSchedulerPlugin/pkg/plugin"
-	"k8s.io/kubernetes/pkg/scheduler/framework/runtime"
+	"k8s.io/kubernetes/cmd/kube-scheduler/app"
 )
 
 func main() {
-	r := make(runtime.Registry)
-	r.Register(plugin.Name, plugin.NewNodeLabelScore)
+	command := app.NewSchedulerCommand(app.WithPlugin(plugin.TracerPluginName, plugin.New))
+	if err := command.Execute(); err != nil {
+		os.Exit(1)
+	}
 }

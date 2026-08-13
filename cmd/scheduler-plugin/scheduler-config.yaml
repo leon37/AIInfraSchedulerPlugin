@@ -1,0 +1,26 @@
+apiVersion: kubescheduler.config.k8s.io/v1
+kind: KubeSchedulerConfiguration
+clientConnection:
+  kubeconfig: /home/leon/.kube/config
+leaderElection:
+  leaderElect: false
+profiles:
+  - schedulerName: my-custom-scheduler
+    plugins:
+      reserve:
+        enabled:
+          - name: tracer-plugin
+      permit:
+        enabled:
+          - name: tracer-plugin
+      preFilter:
+        enabled:
+          - name: tracer-plugin
+      postFilter:
+        enabled:
+          - name: tracer-plugin
+        disabled:
+          - name: DefaultPreemption
+      filter:
+        enabled:
+          - name: tracer-plugin

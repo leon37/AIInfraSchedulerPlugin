@@ -1,0 +1,6 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane # 大脑（Master）
+- role: worker        # 搬砖节点1 (Node A)
+- role: worker        # 搬砖节点2 (Node B)
