@@ -16,11 +16,6 @@ profiles:
       preFilter:
         enabled:
           - name: tracer-plugin
-      postFilter:
-        enabled:
-          - name: tracer-plugin
-        disabled:
-          - name: DefaultPreemption
       filter:
         enabled:
           - name: tracer-plugin
