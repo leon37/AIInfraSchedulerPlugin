@@ -89,6 +89,16 @@ func (t *TracerPlugin) Permit(ctx context.Context, state *framework.CycleState, 
 		}
 		return framework.NewStatus(framework.Error, err.Error()), 0
 	}
+
+	if failed, reason := t.checkAndMarkGangFailed(ctx, p, obj); failed {
+		return framework.NewStatus(framework.Unschedulable, reason), 0
+	}
+
+	round, _, err := unstructured.NestedInt64(obj.Object, "status", "round")
+	if err != nil {
+		return framework.NewStatus(framework.Unschedulable, err.Error()), 0
+	}
+
 	minMember, found, err := unstructured.NestedInt64(obj.Object, "spec", "minMember")
 	if err != nil || !found {
 		return framework.NewStatus(framework.Error, "pod group minMember not found"), 0
@@ -113,38 +123,8 @@ func (t *TracerPlugin) Permit(ctx context.Context, state *framework.CycleState, 
 		})
 		return framework.NewStatus(framework.Success), 0
 	}
+
 	if curWaiting == 0 {
-		failed, found, err := unstructured.NestedBool(obj.Object, "status", "failed")
-		if err != nil {
-			return framework.NewStatus(framework.Unschedulable, err.Error()), 0
-		}
-		if found && failed {
-			return framework.NewStatus(framework.Unschedulable, "pod group fail"), 0
-		}
-		round, _, err := unstructured.NestedInt64(obj.Object, "status", "round")
-		if err != nil {
-			return framework.NewStatus(framework.Unschedulable, err.Error()), 0
-		}
-		roundLimit, found, err := unstructured.NestedInt64(obj.Object, "spec", "scheduleMaxLimit")
-		if err != nil || !found {
-			return framework.NewStatus(framework.Unschedulable, "pod group scheduleMaxLimit not found"), 0
-		}
-		if round >= roundLimit {
-			klog.InfoS("gang gave up, rejecting", "pod", p.Name, "round", round)
-			err = unstructured.SetNestedField(obj.Object, true, "status", "failed")
-			if err != nil {
-				return framework.NewStatus(framework.Unschedulable, err.Error()), 0
-			}
-			err = unstructured.SetNestedField(obj.Object, "gang failed", "status", "reason")
-			if err != nil {
-				return framework.NewStatus(framework.Unschedulable, err.Error()), 0
-			}
-			_, err = t.dyn.Resource(podGroupGVR).Namespace(p.Namespace).UpdateStatus(ctx, obj, v3.UpdateOptions{})
-			if err != nil {
-				return framework.NewStatus(framework.Unschedulable, err.Error()), 0
-			}
-			return framework.NewStatus(framework.Unschedulable, "pod group reach the schedule limit"), 0
-		}
 		err = unstructured.SetNestedField(obj.Object, round+1, "status", "round")
 		if err != nil {
 			return framework.NewStatus(framework.Unschedulable, err.Error()), 0
@@ -201,6 +181,10 @@ func (t *TracerPlugin) PreFilter(ctx context.Context, state *framework.CycleStat
 		return nil, framework.NewStatus(framework.Error, err.Error())
 	}
 
+	if failed, reason := t.checkAndMarkGangFailed(ctx, p, obj); failed {
+		return nil, framework.NewStatus(framework.Unschedulable, reason)
+	}
+
 	details, found, err := unstructured.NestedSlice(obj.Object, "status", "preemptionDetail")
 	if err != nil {
 		return nil, framework.NewStatus(framework.Error, err.Error())
@@ -222,54 +206,6 @@ func (t *TracerPlugin) PreFilter(ctx context.Context, state *framework.CycleStat
 		plans: plans,
 	}
 	state.Write(preemptionPlanState, pfState)
-
-	var curWaiting int32
-	t.handle.IterateOverWaitingPods(func(waiting framework.WaitingPod) {
-		pod := waiting.GetPod()
-		if !isPodSamePodGroup(p, pod) {
-			return
-		}
-		curWaiting++
-	})
-	if curWaiting > 0 {
-		return nil, framework.NewStatus(framework.Success)
-	}
-
-	round, _, err := unstructured.NestedInt64(obj.Object, "status", "round")
-	if err != nil {
-		return nil, framework.NewStatus(framework.Unschedulable, err.Error())
-	}
-	roundLimit, found, err := unstructured.NestedInt64(obj.Object, "spec", "scheduleMaxLimit")
-	if err != nil {
-		return nil, framework.NewStatus(framework.Unschedulable, err.Error())
-	}
-	if !found {
-		return nil, framework.NewStatus(framework.Unschedulable, "pod group scheduleMaxLimit not found")
-	}
-	if round >= roundLimit {
-		klog.InfoS("gang gave up, rejecting", "pod", p.Name, "round", round)
-		failed, found, err := unstructured.NestedBool(obj.Object, "status", "failed")
-		if err != nil {
-			return nil, framework.NewStatus(framework.Unschedulable, err.Error())
-		}
-		if found && failed {
-			return nil, framework.NewStatus(framework.Unschedulable, "pod group fail")
-		}
-		err = unstructured.SetNestedField(obj.Object, true, "status", "failed")
-		if err != nil {
-			return nil, framework.NewStatus(framework.Unschedulable, err.Error())
-		}
-		err = unstructured.SetNestedField(obj.Object, "gang failed", "status", "reason")
-		if err != nil {
-			return nil, framework.NewStatus(framework.Unschedulable, err.Error())
-		}
-		_, err = t.dyn.Resource(podGroupGVR).Namespace(p.Namespace).UpdateStatus(ctx, obj, v3.UpdateOptions{})
-		if err != nil {
-			return nil, framework.NewStatus(framework.Unschedulable, err.Error())
-		}
-
-		return nil, framework.NewStatus(framework.Unschedulable, "pod group reach the schedule limit")
-	}
 
 	return nil, framework.NewStatus(framework.Success)
 }
@@ -312,6 +248,7 @@ func (t *TracerPlugin) Filter(ctx context.Context, state *framework.CycleState, 
 }
 
 func (t *TracerPlugin) PostFilter(ctx context.Context, state *framework.CycleState, p *v1.Pod, filteredNodeStatusMap framework.NodeToStatusMap) (*framework.PostFilterResult, *framework.Status) {
+	klog.Infof("PostFilter called: pod=%s", p.Name)
 	podGroupName, ok := p.Labels["pod-group"]
 	if !ok {
 		return nil, framework.NewStatus(framework.Success)
@@ -326,6 +263,10 @@ func (t *TracerPlugin) PostFilter(ctx context.Context, state *framework.CycleSta
 	minMember, found, err := unstructured.NestedInt64(obj.Object, "spec", "minMember")
 	if err != nil || !found {
 		return nil, framework.NewStatus(framework.Error, "pod group minMember not found")
+	}
+
+	if failed, reason := t.checkAndMarkGangFailed(ctx, p, obj); failed {
+		return nil, framework.NewStatus(framework.Unschedulable, reason)
 	}
 
 	preemptionDetail, found, err := unstructured.NestedSlice(obj.Object, "status", "preemptionDetail")
@@ -377,6 +318,9 @@ func (t *TracerPlugin) PostFilter(ctx context.Context, state *framework.CycleSta
 		var singlePodResourcesRequests int64
 		for _, container := range p.Spec.Containers {
 			singlePodResourcesRequests += container.Resources.Requests.Cpu().MilliValue()
+		}
+		if singlePodResourcesRequests <= 0 {
+			return nil, framework.NewStatus(framework.Unschedulable, "preemption planning skipped: no cpu request")
 		}
 		candidatesGang := make([]string, 0)
 		plans := make(map[string]map[string]int)
@@ -473,4 +417,38 @@ func (t *TracerPlugin) PostFilter(ctx context.Context, state *framework.CycleSta
 
 func calculateNodeAvailableCPU(nodeInfo *framework.NodeInfo) int64 {
 	return nodeInfo.Allocatable.MilliCPU - nodeInfo.Requested.MilliCPU
+}
+
+func (t *TracerPlugin) checkAndMarkGangFailed(ctx context.Context, p *v1.Pod, obj *unstructured.Unstructured) (bool, string) {
+	failed, found, err := unstructured.NestedBool(obj.Object, "status", "failed")
+	if err != nil {
+		return true, err.Error()
+	}
+	if found && failed {
+		return true, "pod group fail"
+	}
+	scheduleTimeout, found, err := unstructured.NestedInt64(obj.Object, "spec", "scheduleTimeoutSeconds")
+	if err != nil || !found {
+		return true, "pod group scheduleTimeoutSeconds not found"
+	}
+
+	creationTimestamp := obj.GetCreationTimestamp()
+	if creationTimestamp.IsZero() {
+		return true, "pod group creationTimestamp not found"
+	} else if time.Since(creationTimestamp.Time) > time.Duration(scheduleTimeout)*time.Second {
+		err = unstructured.SetNestedField(obj.Object, true, "status", "failed")
+		if err != nil {
+			return true, err.Error()
+		}
+		err = unstructured.SetNestedField(obj.Object, "gang schedule timeout failed", "status", "reason")
+		if err != nil {
+			return true, err.Error()
+		}
+		_, err = t.dyn.Resource(podGroupGVR).Namespace(p.Namespace).UpdateStatus(ctx, obj, v3.UpdateOptions{})
+		if err != nil {
+			return true, err.Error()
+		}
+		return true, "gang schedule timeout"
+	}
+	return false, ""
 }
