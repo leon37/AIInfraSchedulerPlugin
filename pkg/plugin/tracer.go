@@ -5,8 +5,10 @@ import (
 	"sort"
 	"time"
 
+	"github.com/leon37/AIInfraSchedulerPlugin/pkg/apis"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	v3 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -247,12 +249,169 @@ func (t *TracerPlugin) Filter(ctx context.Context, state *framework.CycleState, 
 	return framework.NewStatus(framework.Success)
 }
 
+func (t *TracerPlugin) InferencePreemption(ctx context.Context, p *v1.Pod, filteredNodeStatusMap framework.NodeToStatusMap) (*framework.PostFilterResult, *framework.Status) {
+	nodes, err := t.handle.SnapshotSharedLister().NodeInfos().List()
+	if err != nil {
+		return nil, framework.NewStatus(framework.Error, err.Error())
+	}
+
+	victimGang := make(map[string][]*v1.Pod)
+	podNodeMap := make(map[string]string)
+	gangPriorityMap := make(map[string]int32)
+	nominatingInfo := new(framework.NominatingInfo)
+	for _, node := range nodes {
+		nodeIns := node.Node()
+		pods := node.Pods
+		for _, pod := range pods {
+			podIns := pod.Pod
+			pgName, ok := podIns.Labels["pod-group"]
+			if !ok {
+				continue
+			}
+			if *podIns.Spec.Priority < *p.Spec.Priority {
+				victimGang[pgName] = append(victimGang[pgName], podIns)
+				podNodeMap[podIns.Name] = nodeIns.Name
+				gangPriorityMap[pgName] = *podIns.Spec.Priority
+			}
+		}
+	}
+
+	var resourcesRequests = make(v1.ResourceList)
+	for _, container := range p.Spec.Containers {
+		for resourceName, resourceReq := range container.Resources.Requests {
+			org := resourcesRequests[resourceName].DeepCopy()
+			org.Add(resourceReq)
+			resourcesRequests[resourceName] = org
+		}
+	}
+
+	type gangNodeGroup struct {
+		gangName string
+		nodeName string
+		podCount int32
+	}
+
+	candidatesGroup := make([]gangNodeGroup, 0)
+	for gang, pods := range victimGang {
+		for _, node := range nodes {
+			nodeIns := node.Node()
+			status := filteredNodeStatusMap[nodeIns.Name]
+			if status.Code() == framework.UnschedulableAndUnresolvable {
+				continue
+			}
+			curNodeAvailableResource := calculateNodeAvailableResource(node)
+			var podCount int32
+			for _, pod := range pods {
+				if podNodeMap[pod.Name] == nodeIns.Name {
+					podCount++
+					for _, container := range pod.Spec.Containers {
+						for resourceName, resourceReq := range container.Resources.Requests {
+							org := curNodeAvailableResource[resourceName].DeepCopy()
+							org.Add(resourceReq)
+							curNodeAvailableResource[resourceName] = org
+						}
+					}
+				}
+			}
+			if podCount <= 0 {
+				continue
+			}
+
+			if !isResourceEnough(resourcesRequests, curNodeAvailableResource) {
+				continue
+			}
+			candidatesGroup = append(candidatesGroup, gangNodeGroup{
+				gangName: gang,
+				nodeName: nodeIns.Name,
+				podCount: podCount,
+			})
+		}
+	}
+
+	if len(candidatesGroup) <= 0 {
+		return nil, framework.NewStatus(framework.Unschedulable)
+	}
+
+	sort.Slice(candidatesGroup, func(i, j int) bool {
+		if gangPriorityMap[candidatesGroup[i].gangName] == gangPriorityMap[candidatesGroup[j].gangName] {
+			return candidatesGroup[i].podCount < candidatesGroup[j].podCount
+		}
+		return gangPriorityMap[candidatesGroup[i].gangName] < gangPriorityMap[candidatesGroup[j].gangName]
+	})
+	curVictimGang := candidatesGroup[0]
+	klog.Infof("find victim gang candidates candidatesGang %v", curVictimGang)
+
+	nominatingInfo.NominatingMode = framework.ModeOverride
+	nominatingInfo.NominatedNodeName = curVictimGang.nodeName
+	victimPodGroupObj, err := t.dyn.Resource(podGroupGVR).Namespace(p.Namespace).Get(ctx, curVictimGang.gangName, v3.GetOptions{})
+	if err != nil {
+		return nil, framework.NewStatus(framework.Error, err.Error())
+	}
+
+	preemptedInfo := map[string]interface{}{
+		"jobName": p.GetLabels()["jobName"],
+		"jobType": string(apis.JobTypeInference),
+	}
+
+	err = unstructured.SetNestedField(victimPodGroupObj.Object, preemptedInfo, "status", "preemptedBy")
+	if err != nil {
+		return nil, framework.NewStatus(framework.Error, err.Error())
+	}
+	_, err = t.dyn.Resource(podGroupGVR).Namespace(p.Namespace).UpdateStatus(ctx, victimPodGroupObj, v3.UpdateOptions{})
+	if err != nil {
+		return nil, framework.NewStatus(framework.Error, err.Error())
+	}
+
+	return &framework.PostFilterResult{
+		NominatingInfo: nominatingInfo,
+	}, framework.NewStatus(framework.Success)
+}
+
+func isResourceEnough(a, b v1.ResourceList) bool {
+	for rn, rq := range a {
+		valueB := b[rn]
+		if rq.Cmp(valueB) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func calculateNodeAvailableResource(nodeInfo *framework.NodeInfo) v1.ResourceList {
+	nodeAvailableResource := &framework.Resource{
+		MilliCPU:         nodeInfo.Allocatable.MilliCPU - nodeInfo.Requested.MilliCPU,
+		Memory:           nodeInfo.Allocatable.Memory - nodeInfo.Requested.Memory,
+		EphemeralStorage: nodeInfo.Allocatable.EphemeralStorage - nodeInfo.Requested.EphemeralStorage,
+		ScalarResources:  make(map[v1.ResourceName]int64),
+	}
+	for resourceName := range nodeInfo.Allocatable.ScalarResources {
+		nodeAvailableResource.ScalarResources[resourceName] = nodeInfo.Allocatable.ScalarResources[resourceName] - nodeInfo.Requested.ScalarResources[resourceName]
+	}
+	var nodeAllocatableResourceList = make(v1.ResourceList)
+	nodeAllocatableResourceList[v1.ResourceCPU] = *resource.NewMilliQuantity(nodeAvailableResource.MilliCPU, resource.DecimalSI)
+	nodeAllocatableResourceList[v1.ResourceMemory] = *resource.NewQuantity(nodeAvailableResource.Memory, resource.BinarySI)
+	nodeAllocatableResourceList[v1.ResourceEphemeralStorage] = *resource.NewQuantity(nodeAvailableResource.EphemeralStorage, resource.BinarySI)
+	for rn, rq := range nodeAvailableResource.ScalarResources {
+		nodeAllocatableResourceList[rn] = *resource.NewQuantity(rq, resource.DecimalSI)
+	}
+	return nodeAllocatableResourceList
+}
+
 func (t *TracerPlugin) PostFilter(ctx context.Context, state *framework.CycleState, p *v1.Pod, filteredNodeStatusMap framework.NodeToStatusMap) (*framework.PostFilterResult, *framework.Status) {
 	klog.Infof("PostFilter called: pod=%s", p.Name)
-	podGroupName, ok := p.Labels["pod-group"]
+	jobType, ok := p.Labels["jobType"]
 	if !ok {
 		return nil, framework.NewStatus(framework.Success)
 	}
+	if jobType == string(apis.JobTypeInference) {
+		return t.InferencePreemption(ctx, p, filteredNodeStatusMap)
+	}
+
+	podGroupName, ok := p.Labels["pod-group"]
+	if !ok {
+		return nil, framework.NewStatus(framework.Unschedulable)
+	}
+
 	obj, err := t.dyn.Resource(podGroupGVR).Namespace(p.Namespace).Get(ctx, podGroupName, v3.GetOptions{})
 	if err != nil {
 		if errors.IsNotFound(err) {
@@ -389,7 +548,12 @@ func (t *TracerPlugin) PostFilter(ctx context.Context, state *framework.CycleSta
 		if err != nil {
 			return nil, framework.NewStatus(framework.Error, err.Error())
 		}
-		err = unstructured.SetNestedField(victimPodGroupObj.Object, p.Labels["trainjob-name"], "status", "preemptedBy")
+		preemptedByInfo := map[string]interface{}{
+			"jobName": p.Labels["jobName"],
+			"jobType": string(apis.JobTypeTrain),
+		}
+
+		err = unstructured.SetNestedField(victimPodGroupObj.Object, preemptedByInfo, "status", "preemptedBy")
 		if err != nil {
 			return nil, framework.NewStatus(framework.Error, err.Error())
 		}
