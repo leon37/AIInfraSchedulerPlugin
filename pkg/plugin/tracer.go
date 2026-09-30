@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"context"
+	"math"
 	"sort"
 	"time"
 
@@ -276,14 +277,7 @@ func (t *TracerPlugin) InferencePreemption(ctx context.Context, p *v1.Pod, filte
 		}
 	}
 
-	var resourcesRequests = make(v1.ResourceList)
-	for _, container := range p.Spec.Containers {
-		for resourceName, resourceReq := range container.Resources.Requests {
-			org := resourcesRequests[resourceName].DeepCopy()
-			org.Add(resourceReq)
-			resourcesRequests[resourceName] = org
-		}
-	}
+	resourcesRequests := podRequests(p)
 
 	type gangNodeGroup struct {
 		gangName string
@@ -304,13 +298,7 @@ func (t *TracerPlugin) InferencePreemption(ctx context.Context, p *v1.Pod, filte
 			for _, pod := range pods {
 				if podNodeMap[pod.Name] == nodeIns.Name {
 					podCount++
-					for _, container := range pod.Spec.Containers {
-						for resourceName, resourceReq := range container.Resources.Requests {
-							org := curNodeAvailableResource[resourceName].DeepCopy()
-							org.Add(resourceReq)
-							curNodeAvailableResource[resourceName] = org
-						}
-					}
+					addResourceList(curNodeAvailableResource, podRequests(pod))
 				}
 			}
 			if podCount <= 0 {
@@ -474,12 +462,10 @@ func (t *TracerPlugin) PostFilter(ctx context.Context, state *framework.CycleSta
 			curJobPodsNeeded--
 		})
 
-		var singlePodResourcesRequests int64
-		for _, container := range p.Spec.Containers {
-			singlePodResourcesRequests += container.Resources.Requests.Cpu().MilliValue()
-		}
-		if singlePodResourcesRequests <= 0 {
-			return nil, framework.NewStatus(framework.Unschedulable, "preemption planning skipped: no cpu request")
+		// 抢占者单个 Pod 的申请量，按它申请的所有资源维度（CPU、内存、GPU 等扩展资源）
+		singlePodRequests := podRequests(p)
+		if !hasPositiveRequest(singlePodRequests) {
+			return nil, framework.NewStatus(framework.Unschedulable, "preemption planning skipped: no resource request")
 		}
 		candidatesGang := make([]string, 0)
 		plans := make(map[string]map[string]int)
@@ -497,22 +483,22 @@ func (t *TracerPlugin) PostFilter(ctx context.Context, state *framework.CycleSta
 				if status.Code() == framework.UnschedulableAndUnresolvable {
 					continue
 				}
-				curNodeAvailableResourceQuantity := calculateNodeAvailableCPU(node)
+				// 节点当前剩余 + 这个 victim gang 在该节点上的 Pod 能腾出的量
+				curNodeAvailable := calculateNodeAvailableResource(node)
 				for _, pod := range pods {
 					if podNodeMap[pod.Name] == nodeIns.Name {
-						for _, container := range pod.Spec.Containers {
-							curNodeAvailableResourceQuantity += container.Resources.Requests.Cpu().MilliValue()
-						}
+						addResourceList(curNodeAvailable, podRequests(pod))
 					}
 				}
 
-				curNodePodsPlaceCount := min(int(curNodeAvailableResourceQuantity/singlePodResourcesRequests), curGangJobPodsNeeded-totalReplaceCount)
-				if curNodePodsPlaceCount == 0 {
+				// 每种资源各自能放下几个抢占者 Pod，取最小值
+				curNodePodsPlaceCount := min(maxPodsFit(curNodeAvailable, singlePodRequests), curGangJobPodsNeeded-totalReplaceCount)
+				if curNodePodsPlaceCount <= 0 {
 					continue
 				}
 				plans[gang][nodeIns.Name] = curNodePodsPlaceCount
 
-				klog.Infof("node %s gang %s curAvailableCPU %d singlePodResourcesRequests %d", node.Node().Name, gang, curNodeAvailableResourceQuantity, singlePodResourcesRequests)
+				klog.Infof("node %s gang %s available %v singlePodRequests %v placeCount %d", nodeIns.Name, gang, curNodeAvailable, singlePodRequests, curNodePodsPlaceCount)
 
 				if curNodePodsPlaceCount+totalReplaceCount >= curGangJobPodsNeeded {
 					canRelease = true
@@ -579,8 +565,55 @@ func (t *TracerPlugin) PostFilter(ctx context.Context, state *framework.CycleSta
 	return nil, framework.NewStatus(framework.Success)
 }
 
-func calculateNodeAvailableCPU(nodeInfo *framework.NodeInfo) int64 {
-	return nodeInfo.Allocatable.MilliCPU - nodeInfo.Requested.MilliCPU
+// podRequests 返回 Pod 所有容器申请量之和。
+// 简化：不计 init 容器和 Pod overhead（调度器 Filter 会算，本项目的 Pod 都没有这两项）。
+func podRequests(pod *v1.Pod) v1.ResourceList {
+	total := make(v1.ResourceList)
+	for _, container := range pod.Spec.Containers {
+		addResourceList(total, container.Resources.Requests)
+	}
+	return total
+}
+
+// addResourceList 把 add 逐项累加进 dst（原地修改 dst）。
+// Quantity 是值类型，从 map 里取出来的是拷贝，必须写回。
+func addResourceList(dst, add v1.ResourceList) {
+	for resourceName, quantity := range add {
+		cur := dst[resourceName].DeepCopy()
+		cur.Add(quantity)
+		dst[resourceName] = cur
+	}
+}
+
+func hasPositiveRequest(requests v1.ResourceList) bool {
+	for _, quantity := range requests {
+		if quantity.Sign() > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// maxPodsFit 计算 available 里能放下几个申请量为 perPod 的 Pod：
+// 对 perPod 里每一种申请量大于 0 的资源分别算"剩余 ÷ 单个申请"，取最小值。
+// 节点上没有的资源按 0 算，结果就是 0。调用方需保证 perPod 至少有一项大于 0。
+func maxPodsFit(available, perPod v1.ResourceList) int {
+	fit := math.MaxInt
+	for resourceName, need := range perPod {
+		if need.Sign() <= 0 {
+			continue
+		}
+		avail, ok := available[resourceName]
+		if !ok || avail.Sign() <= 0 {
+			return 0
+		}
+		// 统一换成毫单位再整除：CPU 本来就按毫核算，其余资源乘 1000 后在本项目的量级内不会溢出
+		n := int(avail.MilliValue() / need.MilliValue())
+		if n < fit {
+			fit = n
+		}
+	}
+	return fit
 }
 
 func (t *TracerPlugin) checkAndMarkGangFailed(ctx context.Context, p *v1.Pod, obj *unstructured.Unstructured) (bool, string) {
